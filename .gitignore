@@ -1,2 +1,5 @@
+# Ignore MacOS Files
+.DS_Store
+
 # Ignore database files - User should download them manually
 databases/
