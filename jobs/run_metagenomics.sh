@@ -9,7 +9,7 @@
 #$ -j y                                         # Join the standard output and error streams
 #$ -o ${HOME}/logs/metagenomics_$JOB_ID.log     # Output log file
 #$ -tc 35                                       # Number of tasks to run concurrently (40 is the max number of concurrent Box transfers)
-##$ -r y                                        # Re-run the job if it fails
+#$ -r y                                        # Re-run the job if it fails
 
 # -------------------------------------------------------------- #
 # LOGGING FUNCTIONS & COLORS
@@ -579,7 +579,8 @@ cleanup() {
     else
         # Need to compress the fastq files in the kneaddata output directory
         # Check if the fastq files exist in KD_OUT
-        if [[ -s "${KD_OUT}/${SAMPLE}_1_kneaddata_paired_1.fastq" && -s "${KD_OUT}/${SAMPLE}_1_kneaddata_paired_2.fastq" ]]; then
+        if compgen -G "${KD_OUT}/${SAMPLE}*kneaddata_paired_1.fastq" > /dev/null && \
+           compgen -G "${KD_OUT}/${SAMPLE}*kneaddata_paired_2.fastq" > /dev/null; then
             log_info "Fastq files exist in kneaddata output directory"
         else
             log_error "Fastq files do not exist in kneaddata output directory"
