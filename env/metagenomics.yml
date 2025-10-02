@@ -1,6 +1,6 @@
 # metagenomics.yml
 # Creates a single environment that contains:
-# - KneadData 0.12.0 for trimming and host depletion
+# - KneadData 0.12.3 for trimming and host depletion
 # - Kraken2 + Bracken for taxonomy with re-estimation
 # - MetaPhlAn 4 for marker-based taxonomy
 # - HUMAnN 3 for functional profiling
