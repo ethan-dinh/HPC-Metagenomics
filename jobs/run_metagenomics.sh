@@ -94,7 +94,7 @@ prepare_run_env() {
     export NUMEXPR_NUM_THREADS="${THREADS}"
 
     # Point all temp files into your scratch
-    SCRATCH_DIR="$TMPDIR/fastqc_tmp"
+    SCRATCH_DIR="$TMPDIR/metagenomics_tmp"
     mkdir -p "$SCRATCH_DIR"
 
     # Make Java honor it
@@ -165,8 +165,20 @@ load_manifest() {
         EARLY_EXIT=1
         exit 2
     fi
-    if [[ ! -r "${R1_SRC}" ]]; then log_error "R1 not readable: ${R1_SRC}"; exit 3; fi
-    if [[ ! -r "${R2_SRC}" ]]; then log_error "R2 not readable: ${R2_SRC}"; exit 3; fi
+
+    # If running kneaddata then check if the raw files exist
+    if [[ "$RUN_KNEADDATA" -eq 1 ]]; then
+        if [[ ! -r "${R1_SRC}" ]]; then
+            log_error "R1 source file not found or not readable: ${R1_SRC}"
+            EARLY_EXIT=1
+            exit 3
+        fi
+        if [[ ! -r "${R2_SRC}" ]]; then
+            log_error "R2 source file not found or not readable: ${R2_SRC}"
+            EARLY_EXIT=1
+            exit 3
+        fi
+    fi
     
     # Print the manifest information
     log_success "Manifest OK."
@@ -179,6 +191,7 @@ load_manifest() {
     KD_OUT="${WORK}/kneaddata" # This is the output directory for kneaddata
     KR_OUT="${WORK}/kraken2"   # This is the output directory for kraken2
     BR_OUT="${WORK}/bracken" # This is the output directory for bracken
+    HU_OUT="${WORK}/humann"   # This is the output directory for humann
 
     # Defining output directories
     if [[ "$SAVE_TO_SCRATCH" -eq 1 ]]; then
@@ -199,7 +212,8 @@ load_manifest() {
     log_info "KD_OUT: ${KD_OUT}"
     log_info "KR_OUT: ${KR_OUT}"
     log_info "BR_OUT: ${BR_OUT}"
-    mkdir -p "${WORK}" "${KD_OUT}" "${KR_OUT}" "${BR_OUT}" "${OUT_PERSIST}"
+    log_info "HU_OUT: ${HU_OUT}"
+    mkdir -p "${WORK}" "${KD_OUT}" "${KR_OUT}" "${BR_OUT}" "${HU_OUT}" "${OUT_PERSIST}"
 }
 
 # -------------------------------------------------------------- #
@@ -362,7 +376,6 @@ check_tools() {
     fi
     log_success "Kneaddata config.py is pointing to trimmomatic.jar"
 
-
     # Checking for Downstream Tools
     KRAKEN2_BIN="$(which kraken2 || true)"
     if [[ -z "${KRAKEN2_BIN}" ]]; then
@@ -405,8 +418,8 @@ check_tools() {
 run_kneaddata() {
     log_info "Running kneaddata"
 
-    P1=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq")
-    P2=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq")
+    P1=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq.gz")
+    P2=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq.gz")
 
     # If paired outputs don't exist in persistent storage, run kneaddata
     log_info "Searching for kneaddata paired outputs in persistent storage..."
@@ -473,8 +486,8 @@ run_taxonomic_classification() {
     # If the Kraken2 report file does not exist in persistent storage, run Kraken2
     if [[ ! -s "$PKR" && ! -s "$PLB" && "$RUN_KRAKEN2" -eq 1 ]]; then
         if [[ ! -s "$K1" || ! -s "$K2" ]]; then # Check if the kneaddata outputs exist in scratch space
-            P1=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq")
-            P2=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq")
+            P1=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq.gz")
+            P2=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq.gz")
             if [[ -s "$P1" && -s "$P2" ]]; then
                 log_info "Paired KneadData outputs found in persistent storage"
                 log_info "Copying kneaddata paired outputs from persistent storage to scratch space"
@@ -556,6 +569,147 @@ run_taxonomic_classification() {
 }
 
 # -------------------------------------------------------------- #
+# HUMANN FUNCTIONAL PROFILING
+# -------------------------------------------------------------- #
+humann_db_check() {
+    log_info "Checking HUMAnN database installation..."
+
+    # Query available HUMAnN databases
+    local AVAILABLE
+    AVAILABLE=$(humann_databases --available 2>/dev/null)
+
+    # Extract database paths
+    local CHOCO_PATH
+    local UNIREF_PATH
+    CHOCO_PATH=$(echo "$AVAILABLE" | awk '/chocophlan/ {print $3}' | grep -E 'full' || true)
+    UNIREF_PATH=$(echo "$AVAILABLE" | awk '/uniref/ {print $3}' | grep -E 'uniref90_diamond' || true)
+
+    # Check both
+    if [[ -z "$CHOCO_PATH" || -z "$UNIREF_PATH" ]]; then
+        log_error "HUMAnN databases missing:"
+        [[ -z "$CHOCO_PATH" ]] && log_error "  • ChocoPhlAn not found"
+        [[ -z "$UNIREF_PATH" ]] && log_error "  • UniRef90 (DIAMOND) not found"
+        log_error "Please install with:"
+        log_error "  humann_databases --download chocophlan full <db_dir>"
+        log_error "  humann_databases --download uniref90_diamond full <db_dir>"
+        EARLY_EXIT=1
+        exit 1
+    fi
+
+    # Success
+    log_success "Both HUMAnN databases found:"
+    log_info "  • ChocoPhlAn: $CHOCO_PATH"
+    log_info "  • UniRef90:   $UNIREF_PATH"
+}
+
+run_functional_profiling() {
+    # ============================================================
+    # Function: run_functional_profiling
+    # Purpose: Run HUMAnN functional profiling on KneadData outputs
+    # ============================================================
+
+    # Check for database availability
+    humann_db_check
+
+    # Persistent output path for HUMAnN
+    local PHUMANN="${OUT_PERSIST}/${SAMPLE}_humann_out"
+
+    # Only run HUMAnN if not already processed and flag is enabled
+    if [[ ! -d "$PHUMANN" && "$RUN_HUMANN" -eq 1 ]]; then
+        log_info "HUMAnN output directory not found in persistent storage. Preparing to run HUMAnN..."
+
+        # Identify KneadData outputs in scratch
+        local K1=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq" -type f 2>/dev/null | head -n 1)
+        local K2=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq" -type f 2>/dev/null | head -n 1)
+
+        # If missing, attempt to restore from persistent storage
+        if [[ ! -s "$K1" || ! -s "$K2" ]]; then
+            log_warn "KneadData paired outputs not found in scratch. Checking persistent storage..."
+            local P1=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq.gz" -type f 2>/dev/null | head -n 1)
+            local P2=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq.gz" -type f 2>/dev/null | head -n 1)
+
+            if [[ -s "$P1" && -s "$P2" ]]; then
+                log_info "Found KneadData paired outputs in persistent storage. Copying to scratch..."
+                cp -f "$P1" "$KD_OUT/"
+                cp -f "$P2" "$KD_OUT/"
+                log_success "KneadData paired outputs restored to scratch space."
+                K1="${KD_OUT}/$(basename "$P1")"
+                K2="${KD_OUT}/$(basename "$P2")"
+
+                # Need to uncompress before concatenation
+                log_info "Decompressing KneadData paired outputs for HUMAnN input..."
+                pigz -d "$K1" || { log_error "Failed to decompress ${K1}"; exit 1; }
+                pigz -d "$K2" || { log_error "Failed to decompress ${K2}"; exit 1; }
+            else
+                log_error "No valid KneadData outputs found in either scratch or persistent storage."
+                log_error "Please run this script with the --run-kneaddata (-k) flag first."
+                exit 1
+            fi
+        fi
+
+        # Combine paired reads into a single HUMAnN input
+        local COMBINED_FASTQ="${KD_OUT}/${SAMPLE}_kneaddata_combined.fastq"
+        UNCOMP_K1="${K1%.gz}"
+        UNCOMP_K2="${K2%.gz}"
+
+        log_info "Combining paired KneadData outputs into single HUMAnN input..."
+        cat "$UNCOMP_K1" "$UNCOMP_K2" > "$COMBINED_FASTQ" || {
+            log_error "Failed to concatenate paired FASTQ files for HUMAnN input."
+            exit 1
+        }
+        log_success "Combined FASTQ created: $(basename "$COMBINED_FASTQ")"
+
+        # Run HUMAnN
+        log_info "Starting HUMAnN functional profiling for sample: ${SAMPLE}"
+        METAPHLAN_DB="${HOME}/metagenomics/databases/metaphlan_db"
+        CHOCO_DB="${HOME}/metagenomics/databases/humann_dbs/chocophlan"
+        UNIREF_DB="${HOME}/metagenomics/databases/humann_dbs/uniref"
+        LOG_DIR="${HOME}/logs/${STUDY_NAME}/humann_logs"
+        LOG_PATH="${LOG_DIR}/humann_${SAMPLE}.log"
+
+        # Ensure log directory exists
+        mkdir -p "${LOG_DIR}"
+
+        humann \
+            --input "$COMBINED_FASTQ" \
+            --output "${HU_OUT}/" \
+            --threads "${THREADS}" \
+            --nucleotide-database "${CHOCO_DB}" \
+            --protein-database "${UNIREF_DB}" \
+            --memory-use maximum \
+            --remove-temp-output \
+            --o-log "${LOG_PATH}" \
+            --metaphlan-options "--bowtie2db ${METAPHLAN_DB} -x mpa_vOct22_CHOCOPhlAnSGB_202403"
+
+        if [[ $? -eq 0 ]]; then
+            log_success "HUMAnN functional profiling completed successfully for ${SAMPLE}"
+        else
+            log_error "HUMAnN failed for sample ${SAMPLE}. Check ${LOG_PATH} for details."
+            exit 1
+        fi
+
+        # Normalize HUMAnN output
+        # log_info "Normalizing HUMAnN output tables"
+        # humann_renorm_table \
+        #     --input "${HU_OUT}/${SAMPLE}_genefamilies.tsv" \
+        #     --output "${HU_OUT}/${SAMPLE}_genefamilies_relab.tsv" \
+        #     --units relab \
+        #     --update-snames
+
+        # humann_renorm_table \
+        #     --input "${HU_OUT}/${SAMPLE}_pathabundance.tsv" \
+        #     --output "${HU_OUT}/${SAMPLE}_pathabundance_relab.tsv" \
+        #     --units relab \
+        #     --update-snames
+        
+        # log_success "HUMAnN output normalization completed"
+
+    else
+        log_info "HUMAnN already completed or disabled by configuration. Skipping functional profiling."
+    fi
+}
+
+# -------------------------------------------------------------- #
 # CLEANUP TRAP, ALWAYS PERSIST RESULTS
 # -------------------------------------------------------------- #
 cleanup() {
@@ -577,83 +731,114 @@ cleanup() {
         rm -rf "${WORK}"
         log_success "Removed scratch space"
     else
-        # Need to compress the fastq files in the kneaddata output directory
-        # Check if the fastq files exist in KD_OUT
-        if compgen -G "${KD_OUT}/${SAMPLE}*kneaddata_paired_1.fastq" > /dev/null && \
-           compgen -G "${KD_OUT}/${SAMPLE}*kneaddata_paired_2.fastq" > /dev/null; then
-            log_info "Fastq files exist in kneaddata output directory"
-        else
-            log_error "Fastq files do not exist in kneaddata output directory"
-            exit 1
+        if [[ "$RUN_KNEADDATA" -eq 1 ]]; then
+            log_info "Kneaddata was run; preparing to copy outputs to persistent storage"
+
+            # Need to compress the fastq files in the kneaddata output directory
+            # Check if the fastq files exist in KD_OUT
+            if compgen -G "${KD_OUT}/${SAMPLE}*kneaddata_paired_1.fastq" > /dev/null && \
+            compgen -G "${KD_OUT}/${SAMPLE}*kneaddata_paired_2.fastq" > /dev/null; then
+                log_info "Fastq files exist in kneaddata output directory"
+            else
+                log_error "Fastq files do not exist in kneaddata output directory"
+                exit 1
+            fi
+            
+            # Check if Kneaddata outputs exist in persistent storage
+            mkdir -p "${OUT_PERSIST}/kneaddata/"
+            P1_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq.gz")
+            P2_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq.gz")
+            U1_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_unmatched_1.fastq.gz")
+            U2_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_unmatched_2.fastq.gz")
+            if [[ ! -s "$P1_compressed" || ! -s "$P2_compressed" || ! -s "$U1_compressed" || ! -s "$U2_compressed" ]]; then
+                log_info "Copying output files to persistent directory"
+
+                # Compress the fastq files
+                P1_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq")
+                P2_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq")
+                U1_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_unmatched_1.fastq")
+                U2_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_unmatched_2.fastq")
+
+                log_info "Compressing fastq files with pigz using ${THREADS} threads"
+                pigz -p "${THREADS}" "${P1_uncompressed}"
+                pigz -p "${THREADS}" "${P2_uncompressed}"
+                pigz -p "${THREADS}" "${U1_uncompressed}"
+                pigz -p "${THREADS}" "${U2_uncompressed}"
+                log_success "Fastq files compressed"
+
+                # Compress the fastqc directory
+                log_info "Compressing fastqc directory"
+                tar -czf "${KD_OUT}/${SAMPLE}_fastqc.tar.gz" -C "${KD_OUT}" fastqc
+                log_success "Fastqc directory compressed"
+
+                # Remove the fastqc directory
+                log_info "Removing fastqc directory"
+                rm -rf "${KD_OUT}/fastqc/"
+                log_success "Fastqc directory removed"
+
+                log_info "Beginning copy of kneaddata output to persistent directory: ${KD_OUT}/."
+                cp -r --no-dereference "${KD_OUT}/." "${OUT_PERSIST}/kneaddata/" || {
+                    log_error "Failed to copy kneaddata output to persistent directory"
+                    exit 3
+                }
+                log_success "Kneaddata outputs copied to persistent directory"
+            fi
+        fi
+
+        # Check if Kraken2 was run
+        if [[ "$RUN_KRAKEN2" -eq 1 ]]; then
+            log_info "Kraken2 was run; preparing to copy outputs to persistent storage"
+        
+            # Check if Kraken2 outputs exist in persistent storage
+            KRAKEN_REPORT="${OUT_PERSIST}/kraken2/${SAMPLE}.kraken2.report"
+            KRAKEN_LABELS="${OUT_PERSIST}/kraken2/${SAMPLE}.kraken2.labels.tsv"
+            if [[ ! -s "$KRAKEN_REPORT" || ! -s "$KRAKEN_LABELS" ]]; then
+                log_info "Copying output files to persistent directory"
+                mkdir -p "${OUT_PERSIST}/kraken2/"
+                log_info "Beginning copy of kraken2 output to persistent directory: ${KR_OUT}/."
+                cp -r --no-dereference "${KR_OUT}/." "${OUT_PERSIST}/kraken2/" || {
+                    log_error "Failed to copy kraken2 output to persistent directory"
+                    exit 3
+                }
+                log_success "Kraken2 outputs copied to persistent directory"
+            fi
+        fi
+
+        if [[ "$RUN_BRACKEN" -eq 1 ]]; then
+            log_info "Bracken was run; preparing to copy outputs to persistent storage"
+
+            # Check if Bracken outputs exist in persistent storage
+            BRACKEN_OUT="${OUT_PERSIST}/bracken/${SAMPLE}.bracken.tsv"
+            if [[ ! -s "$BRACKEN_OUT" ]]; then
+                log_info "Copying output files to persistent directory"
+                mkdir -p "${OUT_PERSIST}/bracken/"
+                log_info "Beginning copy of bracken output to persistent directory: ${BR_OUT}/."
+                cp -r --no-dereference "${BR_OUT}/." "${OUT_PERSIST}/bracken/" || {
+                    log_error "Failed to copy bracken output to persistent directory"
+                    exit 3
+                }
+                log_success "Bracken outputs copied to persistent directory"
+            fi
         fi
         
-        # Check if Kneaddata outputs exist in persistent storage
-        mkdir -p "${OUT_PERSIST}/kneaddata/"
-        P1_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq.gz")
-        P2_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq.gz")
-        U1_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_unmatched_1.fastq.gz")
-        U2_compressed=$(find "${OUT_PERSIST}/kneaddata/" -name "${SAMPLE}_*_kneaddata_unmatched_2.fastq.gz")
-        if [[ ! -s "$P1_compressed" || ! -s "$P2_compressed" || ! -s "$U1_compressed" || ! -s "$U2_compressed" ]]; then
-            log_info "Copying output files to persistent directory"
+        if [[ "$RUN_HUMANN" -eq 1 ]]; then
+            log_info "HUMAnN was run; preparing to copy outputs to persistent storage"
 
-            # Compress the fastq files
-            P1_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_paired_1.fastq")
-            P2_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_paired_2.fastq")
-            U1_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_unmatched_1.fastq")
-            U2_uncompressed=$(find "${KD_OUT}/" -name "${SAMPLE}_*_kneaddata_unmatched_2.fastq")
-
-            log_info "Compressing fastq files with pigz using ${THREADS} threads"
-            pigz -p "${THREADS}" "${P1_uncompressed}"
-            pigz -p "${THREADS}" "${P2_uncompressed}"
-            pigz -p "${THREADS}" "${U1_uncompressed}"
-            pigz -p "${THREADS}" "${U2_uncompressed}"
-            log_success "Fastq files compressed"
-
-            # Compress the fastqc directory
-            log_info "Compressing fastqc directory"
-            tar -czf "${KD_OUT}/${SAMPLE}_fastqc.tar.gz" -C "${KD_OUT}" fastqc
-            log_success "Fastqc directory compressed"
-
-            # Remove the fastqc directory
-            log_info "Removing fastqc directory"
-            rm -rf "${KD_OUT}/fastqc/"
-            log_success "Fastqc directory removed"
-
-            log_info "Beginning copy of kneaddata output to persistent directory: ${KD_OUT}/."
-            cp -r --no-dereference "${KD_OUT}/." "${OUT_PERSIST}/kneaddata/" || {
-                log_error "Failed to copy kneaddata output to persistent directory"
-                exit 3
-            }
-            log_success "Kneaddata outputs copied to persistent directory"
+            # Check if HUMAnN outputs exist in persistent storage
+            HUMANN_OUT="${OUT_PERSIST}/humann/"
+            if [[ ! -d "$HUMANN_OUT" ]]; then
+                log_info "Copying output files to persistent directory"
+                mkdir -p "${OUT_PERSIST}/humann/"
+                log_info "Beginning copy of humann output to persistent directory: ${HU_OUT}/."
+                cp -r --no-dereference "${HU_OUT}/." "${HUMANN_OUT}/" || {
+                    log_error "Failed to copy humann output to persistent directory"
+                    exit 3
+                }
+                log_success "HUMAnN outputs copied to persistent directory"
+            fi
         fi
 
-        # Check if Kraken2 outputs exist in persistent storage
-        KRAKEN_REPORT="${OUT_PERSIST}/kraken2/${SAMPLE}.kraken2.report"
-        KRAKEN_LABELS="${OUT_PERSIST}/kraken2/${SAMPLE}.kraken2.labels.tsv"
-        if [[ ! -s "$KRAKEN_REPORT" || ! -s "$KRAKEN_LABELS" ]]; then
-            log_info "Copying output files to persistent directory"
-            mkdir -p "${OUT_PERSIST}/kraken2/"
-            log_info "Beginning copy of kraken2 output to persistent directory: ${KR_OUT}/."
-            cp -r --no-dereference "${KR_OUT}/." "${OUT_PERSIST}/kraken2/" || {
-                log_error "Failed to copy kraken2 output to persistent directory"
-                exit 3
-            }
-            log_success "Kraken2 outputs copied to persistent directory"
-        fi
-
-        # Check if Bracken outputs exist in persistent storage
-        BRACKEN_OUT="${OUT_PERSIST}/bracken/${SAMPLE}.bracken.tsv"
-        if [[ ! -s "$BRACKEN_OUT" ]]; then
-            log_info "Copying output files to persistent directory"
-            mkdir -p "${OUT_PERSIST}/bracken/"
-            log_info "Beginning copy of bracken output to persistent directory: ${BR_OUT}/."
-            cp -r --no-dereference "${BR_OUT}/." "${OUT_PERSIST}/bracken/" || {
-                log_error "Failed to copy bracken output to persistent directory"
-                exit 3
-            }
-            log_success "Bracken outputs copied to persistent directory"
-        fi
-
+        # Copying qstat results to persistent directory
         qstat -j "$JOB_ID" &>"${OUT_PERSIST}/qstat_${JOB_ID}_${TASK_INDEX}.txt" || {
             log_error "Failed to copy qstat output to persistent directory"
             exit 3
@@ -751,6 +936,7 @@ usage() {
     echo "  -k | --run-kneaddata    Run kneaddata"
     echo "  -r | --run-kraken2      Run kraken2"
     echo "  -b | --run-bracken      Run bracken"
+    echo "  -f | --run-humann       Run humann"
     echo "  -a | --all              Run all steps"
     echo "  -m | --manifest         Path to the manifest file"
     echo "  -t | --transfer-to-box  Transfer output files to Box"
@@ -768,6 +954,7 @@ handle_args() {
     RUN_KNEADDATA=0
     RUN_KRAKEN2=0
     RUN_BRACKEN=0
+    RUN_HUMANN=0
     TRANSFER_TO_BOX=0
     SAVE_TO_SCRATCH=0
     NO_CLEANUP=0
@@ -782,8 +969,9 @@ handle_args() {
         --run-kneaddata)    RUN_KNEADDATA=1; shift ;;
         --run-kraken2)      RUN_KRAKEN2=1;   shift ;;
         --run-bracken)      RUN_BRACKEN=1;   shift ;;
+        --run-humann)       RUN_HUMANN=1;    shift ;;
         --transfer-to-box)  TRANSFER_TO_BOX=1; shift ;;
-        --output-base-dir)  OUT_PERSIST="$2"; shift; shift ;;
+        --output-base-dir)  OUT_BASE_DIR="$2"; shift; shift ;;
         --box-dir)          BOX_TRANSFER_DIR="$2"; shift; shift ;;
         --save-to-scratch)  SAVE_TO_SCRATCH=1; shift ;;
         --all)              RUN_KNEADDATA=1; RUN_KRAKEN2=1; RUN_BRACKEN=1; shift ;;
@@ -797,11 +985,12 @@ handle_args() {
     done
 
     OPTIND=1
-    while getopts "krbatshd:o:m:n:" opt; do
+    while getopts "krbfatshd:o:m:n:" opt; do
         case "$opt" in
             k)  RUN_KNEADDATA=1 ;;
             r)  RUN_KRAKEN2=1 ;;
             b)  RUN_BRACKEN=1 ;;
+            f)  RUN_HUMANN=1 ;;
             a)  RUN_KNEADDATA=1; RUN_KRAKEN2=1; RUN_BRACKEN=1 ;;
             t)  TRANSFER_TO_BOX=1 ;;
             d)  BOX_TRANSFER_DIR="$OPTARG" ;;
@@ -850,6 +1039,13 @@ main() {
     if [[ "$RUN_KRAKEN2" -eq 1 || "$RUN_BRACKEN" -eq 1 ]]; then
         log_info "Running taxonomic classification"
         run_taxonomic_classification
+    fi
+
+    if [[ "$RUN_HUMANN" -eq 1 ]]; then
+        log_info "Running functional profiling with HUMANN"
+        run_functional_profiling
+    else
+        log_info "Skipping HUMANN"
     fi
 }
 
