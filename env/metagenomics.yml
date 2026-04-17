@@ -32,3 +32,7 @@ dependencies:
   # Functional profiling
   - humann=3.8
   - diamond=2.1.10
+
+  # SRA data retrieval
+  - sra-tools=3.1.1
+  - entrez-direct=22.4
